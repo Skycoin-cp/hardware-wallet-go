@@ -46,10 +46,16 @@ var (
 	ErrDeviceTypeEmulator = errors.New("device type cannot be emulator")
 	// ErrInvalidWordCount is returned if word count is not valid mnemonic word length
 	ErrInvalidWordCount = errors.New("word count must be 12 or 24")
+	// ErrInvalidArgCountForEmulatorIPAddress emulator ip address is the only one expected argument for emulatorAddress
+	ErrInvalidArgCountForEmulatorIPAddress = errors.New("emulator ip address is the only one expected argument for emulatorAddress")
 	// ErrNoDeviceConnected is returned if no device is connected to the system
 	ErrNoDeviceConnected = errors.New("no device connected")
 	// ErrInvalidWalletType a valid wallet type should  be specified
 	ErrInvalidWalletType = errors.New("invalid wallet type, options are: " + WalletTypeDeterministic + " or " + WalletTypeBip44)
+	// ErrUserCancelledWithDeviceButton the requested operation has been canceled from the device input button
+	ErrUserCancelledWithDeviceButton = errors.New("the requested operation has been canceled from the device input button")
+	// ErrUserCancelledFromInputReader the requested operation has been canceled from the device input button
+	ErrUserCancelledFromInputReader = errors.New("the requested operation has been canceled from the user interaction")
 )
 
 const (
@@ -64,22 +70,54 @@ const (
 	firstHardenedChild = uint32(0x80000000)
 )
 
+// InputRequestKind specify the input required for the reader
+type InputRequestKind uint32
+const (
+	// RequestKindPinMatrix require an input reader for a matrix
+	RequestKindPinMatrix InputRequestKind = iota
+	// RequestKindPassphrase require an input reader for a pass phrase
+	RequestKindPassphrase
+	// RequestKindWord require an input reader for a word
+	RequestKindWord
+	// RequestInformUserOnlyOk no special input, just accept
+	RequestInformUserOnlyOk
+	// RequestInformUserOnlyCancel just cancel if required
+	RequestInformUserOnlyCancel
+	// RequestInformUserOkAndCancel use ok or cancel inpt reader as required
+	RequestInformUserOkAndCancel
+)
+
 //go:generate mockery -name Devicer -case underscore -inpkg -testonly
 
 // Devicer provides api for the hw wallet functions
 type Devicer interface {
+	// AddressGen generate addresses
 	AddressGen(addressN, startIndex uint32, confirmAddress bool, walletType string) (wire.Message, error)
+	// ApplySettings to the device
 	ApplySettings(usePassphrase *bool, label string, language string) (wire.Message, error)
+	// Backup create a seed backup
 	Backup() (wire.Message, error)
+	// Cancel cancel current operation
 	Cancel() (wire.Message, error)
+	// CheckMessageSignature check if a message signature is valid
 	CheckMessageSignature(message, signature, address string) (wire.Message, error)
+	// ChangePin change device PIN
 	ChangePin(removePin *bool) (wire.Message, error)
+	// Connected check if the is a device connected
 	Connected() bool
+	// Available check if the device is reachable
 	Available() bool
-	FirmwareUpload(payload []byte, hash [32]byte) error
+	// EraseFirmware erase device firmware (bootloader mode).
+	EraseFirmware(length uint32) (wire.Message, error)
+	// UploadFirmware upload a new firmware (bootloader mode).
+	UploadFirmware(payload []byte, hash [32]byte) (wire.Message, error)
+	// GetFeatures return the device features
 	GetFeatures() (wire.Message, error)
+	// GenerateMnemonic generate a mnemonic
 	GenerateMnemonic(wordCount uint32, usePassphrase bool) (wire.Message, error)
+	// Recovery a device mnemonic
 	Recovery(wordCount uint32, usePassphrase *bool, dryRun bool) (wire.Message, error)
+	// SetMnemonic sets a specific mnemonic
 	SetMnemonic(mnemonic string) (wire.Message, error)
 	TransactionSign(inputs []*messages.SkycoinTransactionInput, outputs []*messages.SkycoinTransactionOutput, walletType string) (wire.Message, error)
 	SignMessage(addressN, addressIndex int, message string, walletType string) (wire.Message, error)
@@ -126,8 +164,8 @@ func DeviceTypeFromString(deviceType string) DeviceType {
 var devSingleCreator sync.Once
 var devSingleInstance *Device
 
-func newDevice(deviceType DeviceType) *Device {
-	driver, err := NewDriver(deviceType)
+func newDevice(deviceType DeviceType, emulatorAddress ...string) *Device {
+	driver, err := NewDriver(deviceType, emulatorAddress...)
 	if err != nil {
 		log.Fatalf("failed to create driver: %s", err)
 	}
@@ -143,11 +181,11 @@ func newDevice(deviceType DeviceType) *Device {
 }
 
 // NewDevice returns a new device instance
-func NewDevice(deviceType DeviceType) *Device {
+func NewDevice(deviceType DeviceType, emulatorAddress ...string) *Device {
 	// TODO rename NewDevice to DeviceInstance as this is a singleton
 	// implementation.
 	devSingleCreator.Do(func() {
-		devSingleInstance = newDevice(deviceType)
+		devSingleInstance = newDevice(deviceType, emulatorAddress...)
 	})
 	return devSingleInstance
 }
@@ -579,91 +617,39 @@ func (d *Device) Available() bool {
 	return true
 }
 
-// FirmwareUpload Updates device's firmware
-func (d *Device) FirmwareUpload(payload []byte, hash [32]byte) error {
+// EraseFirmware erase current firmware
+func (d *Device) EraseFirmware(length uint32) (wire.Message, error) {
 	if d.Driver.DeviceType() != DeviceTypeUSB {
-		return ErrDeviceTypeEmulator
+		return wire.Message{}, ErrDeviceTypeEmulator
 	}
-
 	if err := d.Connect(); err != nil {
-		return err
+		return wire.Message{}, err
 	}
 	defer d.Disconnect()
-
 	if err := Initialize(d.dev); err != nil {
-		return err
+		return wire.Message{}, err
 	}
-
-	log.Printf("Length of firmware %d", uint32(len(payload)))
-
-	chunks, err := MessageFirmwareErase(payload)
+	eraseFirmwareChunks, err := MessageFirmwareErase(length)
 	if err != nil {
-		return err
+		return wire.Message{}, err
 	}
-	erasemsg, err := d.Driver.SendToDevice(d.dev, chunks)
+	return d.Driver.SendToDevice(d.dev, eraseFirmwareChunks)
+}
+
+// UploadFirmware upload a new firmware
+func (d *Device) UploadFirmware(payload []byte, hash [32]byte) (wire.Message, error) {
+	if d.Driver.DeviceType() != DeviceTypeUSB {
+		return wire.Message{}, ErrDeviceTypeEmulator
+	}
+	if err := d.Connect(); err != nil {
+		return wire.Message{}, err
+	}
+	defer d.Disconnect()
+	uploadFirmwareChunks, err := MessageFirmwareUpload(payload, hash)
 	if err != nil {
-		return err
+		return wire.Message{}, err
 	}
-
-	switch erasemsg.Kind {
-	case uint16(messages.MessageType_MessageType_Success):
-		log.Printf("Success %d! FirmwareErase %s\n", erasemsg.Kind, erasemsg.Data)
-	case uint16(messages.MessageType_MessageType_Failure):
-		msg, err := DecodeFailMsg(erasemsg)
-		if err != nil {
-			return err
-		}
-
-		return errors.New(msg)
-	default:
-		return fmt.Errorf("received unexpected message type: %s", messages.MessageType(erasemsg.Kind))
-	}
-
-	log.Printf("Hash: %x\n", hash)
-
-	chunks, err = MessageFirmwareUpload(payload, hash)
-	if err != nil {
-		return err
-	}
-	uploadmsg, err := d.Driver.SendToDevice(d.dev, chunks)
-	if err != nil {
-		return err
-	}
-
-	switch uploadmsg.Kind {
-	case uint16(messages.MessageType_MessageType_ButtonRequest):
-		log.Println("Please confirm in the device if fingerprints match")
-		// Send ButtonAck
-		chunks, err = MessageButtonAck()
-		if err != nil {
-			return err
-		}
-		resp, err := d.Driver.SendToDevice(d.dev, chunks)
-		if err != nil {
-			return err
-		}
-		switch resp.Kind {
-		case uint16(messages.MessageType_MessageType_Success):
-			return nil
-		case uint16(messages.MessageType_MessageType_Failure):
-			var msgStr string
-			if msgStr, err = DecodeFailMsg(resp); err != nil {
-				return err
-			}
-			return errors.New(msgStr)
-		default:
-			return errors.New("unknown response")
-		}
-	case uint16(messages.MessageType_MessageType_Failure):
-		msg, err := DecodeFailMsg(erasemsg)
-		if err != nil {
-			return err
-		}
-
-		return errors.New(msg)
-	default:
-		return fmt.Errorf("received unexpected message type: %s", messages.MessageType(erasemsg.Kind))
-	}
+	return d.Driver.SendToDevice(d.dev, uploadFirmwareChunks)
 }
 
 // GetFeatures send Features message to the device

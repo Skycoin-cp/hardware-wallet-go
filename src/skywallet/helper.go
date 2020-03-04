@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -88,15 +89,23 @@ func initUsb() []usb.Bus {
 }
 
 // NewDriver create a new device driver
-func NewDriver(deviceType DeviceType) (*Driver, error) {
+func NewDriver(deviceType DeviceType, emulatorAddress ...string) (*Driver, error) {
 	switch deviceType {
 	case DeviceTypeUSB:
+		if len(emulatorAddress) > 0 {
+			log.WithField("emulatorAddress", emulatorAddress).Warningln("ip addresses ignored as this does not make sense for physical device")
+		}
 		return &Driver{
 			deviceType: deviceType,
 			bus:        usb.Init(initUsb()...),
 		}, nil
 	case DeviceTypeEmulator:
-		udpBus, err := usb.InitUDP([]int{EmulatorPort})
+		if len(emulatorAddress) == 0 {
+			emulatorAddress = []string{"127.0.0.1"}
+		} else if len(emulatorAddress) > 1 {
+			return nil, ErrInvalidArgCountForEmulatorIPAddress
+		}
+		udpBus, err := usb.InitUDP([]int{EmulatorPort}, emulatorAddress[0])
 		if err != nil {
 			return nil, err
 		}
@@ -199,6 +208,9 @@ func sendToDevice(dev usb.Device, chunks [][64]byte) (wire.Message, error) {
 
 	msg, err = wire.ReadFrom(dev)
 	if err != nil {
+		if strings.Contains(err.Error(), "read: connection refused") {
+			return wire.Message{}, ErrNoDeviceConnected
+		}
 		return wire.Message{}, err
 	}
 
